@@ -33,6 +33,7 @@ def score_protein(
     residue_sequence_dir: str,
     structure_sequence_dir: str,
     mutant_dir: str,
+    output_mutant_dir: str,
     name: str,
     model_name: str,
 ):
@@ -40,6 +41,7 @@ def score_protein(
     residue_fasta = Path(residue_sequence_dir) / f"{name}.fasta"
     structure_fasta = Path(structure_sequence_dir) / f"{name}.fasta"
     mutant_file = Path(mutant_dir) / f"{name}.csv"
+    output_mutant_file = Path(output_mutant_dir) / f"{name}.csv"
     sequence = read_seq(residue_fasta)
     structure_sequence = read_seq(structure_fasta)
 
@@ -72,7 +74,7 @@ def score_protein(
         scores.append(pred_score)
 
     df[model_name] = scores
-    df.to_csv(mutant_file, index=False)
+    df.to_csv(output_mutant_file, index=False)
     corr = spearmanr(df["DMS_score"], df[model_name]).correlation
     print(f"{name}: {corr}")
 
@@ -108,11 +110,23 @@ def main():
         help="Directory containing CSV files with mutants",
     )
     args = parser.parse_args()
+    output_mutant_dir = Path(args.mutant_dir).parent / "substitutions_copy"
+    output_mutant_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Scored CSV outputs will be written to: {output_mutant_dir}")
 
     print("Loading model...")
     model = AutoModelForMaskedLM.from_pretrained(
         args.model_path, trust_remote_code=True
     )
+
+    model.cls.predictions.decoder.weight = (
+        model.prosst.embeddings.word_embeddings.weight
+    )
+    assert model.cls.predictions.decoder.weight.data_ptr() == model.prosst.embeddings.word_embeddings.weight.data_ptr()
+    print("Manually tied ✓")
+    print("Decoder weight shape:", model.cls.predictions.decoder.weight.shape)
+    print("Embedding weight shape:", model.prosst.embeddings.word_embeddings.weight.shape)
+
     model = model.to(device)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
@@ -127,6 +141,7 @@ def main():
             residue_sequence_dir=args.residue_dir,
             structure_sequence_dir=args.structure_dir,
             mutant_dir=args.mutant_dir,
+            output_mutant_dir=str(output_mutant_dir),
             model_name=model_name,
             name=protein_name,
         )
