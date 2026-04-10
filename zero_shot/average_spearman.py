@@ -20,7 +20,7 @@ def discover_score_column(df, explicit_column=None):
 
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--data_dir", type=str, default="zero_shot/example_data/substituitions_copy")
+    parser.add_argument("--data_dir", type=str, default="zero_shot/example_data/substitutions_copy")
     parser.add_argument("--reference_file", type=str, default="zero_shot/example_data/DMS_substitutions.csv",
                         help="Path to DMS substitutions reference CSV")
     parser.add_argument("--score_column", type=str, default=None)

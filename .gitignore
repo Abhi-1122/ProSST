@@ -191,8 +191,6 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/python,linux
 .code/
 .vscode/
-zero_shot/example_data/proteingym_benchmark.zip
-zero_shot/example_data/residue_sequence
-zero_shot/example_data/structure_sequence
-zero_shot/example_data/substitutions
+zero_shot/example_data/
+zero_shot/cache_subgraphs_all/
 ProteinGym_v1_AlphaFold2_PDB

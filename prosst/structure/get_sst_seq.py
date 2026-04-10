@@ -17,16 +17,66 @@ from pathos.threading import ThreadPool
 from pathlib import Path
 
 def iter_parallel_map(func, data, workers: int = 2):
-    pool = Pool(workers)
-    return pool.imap(func, data)
+    if workers <= 1:
+        def _serial_generator():
+            for item in data:
+                yield func(item)
+        return _serial_generator()
+
+    def _parallel_generator():
+        with Pool(workers) as pool:
+            for result in pool.imap(func, data):
+                yield result
+
+    return _parallel_generator()
 
 def iter_threading_map(func, data, workers: int = 2):
-    pool = ThreadPool(workers)
-    return pool.imap(func, data)
+    if workers <= 1:
+        def _serial_generator():
+            for item in data:
+                yield func(item)
+        return _serial_generator()
+
+    def _thread_generator():
+        with ThreadPool(workers) as pool:
+            for result in pool.imap(func, data):
+                yield result
+
+    return _thread_generator()
 
 def threading_map(func, data, workers: int = 2):
-    pool = ThreadPool(workers)
-    return pool.map(func, data)
+    data = list(data)
+    if workers <= 1:
+        return [func(item) for item in data]
+    with ThreadPool(workers) as pool:
+        results = pool.map(func, data)
+    return results
+
+
+def _shutdown_dataloader_workers(dataloader):
+    iterator = getattr(dataloader, "_iterator", None)
+    if iterator is not None and hasattr(iterator, "_shutdown_workers"):
+        iterator._shutdown_workers()
+    dataloader._iterator = None
+
+
+class ManagedDataLoader:
+    """Wrap a DataLoader and force worker shutdown when iteration ends."""
+
+    def __init__(self, dataloader):
+        self._dl = dataloader
+
+    def __iter__(self):
+        try:
+            yield from self._dl
+        finally:
+            _shutdown_dataloader_workers(self._dl)
+
+    def __len__(self):
+        return len(self._dl)
+
+    def __getattr__(self, name):
+        return getattr(self._dl, name)
 
 warnings.filterwarnings("ignore")
 
@@ -57,6 +107,52 @@ def predict_sturcture(model, cluster_models, dataloader, device):
                 struc_label_dict[name].extend(batch_structure_labels)
 
     return struc_label_dict
+
+
+def predict_soft_structure_embeddings(
+    model,
+    cluster_model_path: str,
+    dataloader,
+    device,
+    temperature: float = 0.1,
+):
+    """
+    Instead of hard k-means assignment (argmin), compute a soft weighted sum
+    over all codebook centroids for each residue embedding.
+
+    Returns:
+        Tensor of shape (total_residues, codebook_dim)
+        where codebook_dim = 256 (the GVP embedding dimension)
+    """
+    if temperature <= 0:
+        raise ValueError("temperature must be > 0")
+
+    cluster_model = joblib.load(cluster_model_path)
+    centroids = torch.tensor(
+        cluster_model.cluster_centers_, dtype=torch.float32, device=device
+    )
+
+    epoch_iterator = tqdm(dataloader)
+    all_node_embeddings = []
+
+    with torch.no_grad():
+        for batch in epoch_iterator:
+            batch.to(device)
+            h_V = (batch.node_s, batch.node_v)
+            h_E = (batch.edge_s, batch.edge_v)
+
+            node_embeddings = model.get_embedding(h_V, batch.edge_index, h_E)
+            node_embeddings_norm = F.normalize(node_embeddings, p=2, dim=-1)
+            centroids_norm = F.normalize(centroids, p=2, dim=-1)
+
+            cosine_sim = torch.mm(node_embeddings_norm, centroids_norm.T)
+            soft_weights = torch.softmax(cosine_sim / temperature, dim=-1)
+            soft_embeddings = torch.mm(soft_weights, centroids)
+
+            all_node_embeddings.append(soft_embeddings.cpu())
+
+    all_node_embeddings = torch.cat(all_node_embeddings, dim=0)
+    return all_node_embeddings
 
 
 def get_embeds(model, dataloader, device, pooling="mean"):
@@ -123,12 +219,12 @@ def subgraph_conventer(subgraph_dir, pdb_dir, max_batch_nodes, num_processes=12)
 
     data_loader = DataLoader(
         subgraph_files,
-        num_workers=num_processes,
+        num_workers=0 if num_processes <= 1 else num_processes,
         batch_sampler=BatchSampler(node_counts, max_batch_nodes, shuffle=False),
         collate_fn=collate_fn,
     )
 
-    return data_loader, results
+    return ManagedDataLoader(data_loader), results
 
 
 def graph_conventer(
@@ -209,12 +305,12 @@ def graph_conventer(
 
     data_loader = DataLoader(
         dataset,
-        num_workers=num_processes,
+        num_workers=0 if num_processes <= 1 else num_processes,
         batch_sampler=BatchSampler(node_counts, max_batch_nodes, shuffle=False),
         collate_fn=collate_fn,
     )
 
-    return data_loader, results
+    return ManagedDataLoader(data_loader), results
 
 
 def process_pdb_file(
@@ -290,15 +386,27 @@ def pdb_conventer(
             cache_subgraph_dir,
         )
         
-    for result in tqdm(iter_parallel_map(handle_pdf_file, pdb_files, num_processes), total=len(pdb_files)):
+    total_pdb_files = len(pdb_files)
+    for index, result in enumerate(
+        tqdm(iter_parallel_map(handle_pdf_file, pdb_files, num_processes), total=total_pdb_files),
+        start=1,
+    ):
         pdb_subgraphs, result_dict, node_count = result
         if pdb_subgraphs is None:
             error_proteins.append(result_dict["name"])
             error_messages.append(result_dict["error"])
+            print(
+                f"[{index}/{total_pdb_files}] Failed: {result_dict['name']} ({result_dict['error']})",
+                flush=True,
+            )
             continue
         dataset.append(pdb_subgraphs)
         results.append(result_dict)
         node_counts.append(node_count)
+        print(
+            f"[{index}/{total_pdb_files}] Built subgraphs for {result_dict['name']} ({node_count} residues)",
+            flush=True,
+        )
         
     # save the error file
     if error_proteins:
@@ -327,14 +435,14 @@ def pdb_conventer(
 
     data_loader = DataLoader(
         dataset,
-        num_workers=num_processes,
+        num_workers=0 if num_processes <= 1 else num_processes,
         batch_sampler=BatchSampler(
             node_counts, max_batch_nodes=max_batch_nodes, shuffle=False
         ),
         collate_fn=collate_fn,
     )
 
-    return data_loader, results
+    return ManagedDataLoader(data_loader), results
 
 
 class SSTPredictor:
@@ -427,6 +535,12 @@ class SSTPredictor:
         """
         if isinstance(pdb_files, str):
             pdb_files = [pdb_files]
+
+        local_num_processes = self.num_processes
+        local_num_threads = self.num_threads
+        if len(pdb_files) == 1:
+            local_num_processes = 1
+            local_num_threads = 1
             
         data_loader, results = pdb_conventer(
             pdb_files, 
@@ -434,8 +548,8 @@ class SSTPredictor:
             self.max_distance, 
             self.max_batch_nodes, 
             error_file, 
-            self.num_processes, 
-            self.num_threads, 
+            local_num_processes, 
+            local_num_threads, 
             cache_subgraph_dir
         )
         
