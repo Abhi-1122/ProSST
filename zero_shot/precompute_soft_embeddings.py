@@ -117,8 +117,8 @@ def _collect_graph_embeddings(model, dataloader, device):
     return torch.cat(all_graph_embeddings, dim=0)
 
 
-def _soft_from_node_embeddings(
-    node_embeddings_cpu: torch.Tensor,
+def _token_distribution_from_graph_embeddings(
+    graph_embeddings_cpu: torch.Tensor,
     centroids: torch.Tensor,
     cluster_model,
     temperature: float,
@@ -129,7 +129,7 @@ def _soft_from_node_embeddings(
         raise ValueError("temperature must be >= 0")
 
     centroids_norm = F.normalize(centroids, p=2, dim=-1)
-    total = node_embeddings_cpu.shape[0]
+    total = graph_embeddings_cpu.shape[0]
     chunks = []
 
     with torch.no_grad():
@@ -139,23 +139,21 @@ def _soft_from_node_embeddings(
             total=(total + chunk_size - 1) // chunk_size,
         ):
             end = min(start + chunk_size, total)
-            node_chunk = node_embeddings_cpu[start:end].to(device)
+            graph_chunk = graph_embeddings_cpu[start:end].to(device)
+            graph_chunk_norm = F.normalize(graph_chunk, p=2, dim=-1)
             if temperature == 0:
-                node_chunk_norm = F.normalize(node_chunk, p=2, dim=-1)
-                hard_idx_np = cluster_model.predict(node_chunk_norm.detach().cpu().numpy())
+                hard_idx_np = cluster_model.predict(graph_chunk_norm.detach().cpu().numpy())
                 hard_idx = torch.as_tensor(hard_idx_np, dtype=torch.long, device=device)
-                soft_embeddings = centroids[hard_idx]
+                chunks.append(hard_idx.cpu())
             else:
-                node_chunk_norm = F.normalize(node_chunk, p=2, dim=-1)
-                cosine_sim = torch.mm(node_chunk_norm, centroids_norm.T)
+                cosine_sim = torch.mm(graph_chunk_norm, centroids_norm.T)
                 soft_weights = torch.softmax(cosine_sim / temperature, dim=-1)
-                soft_embeddings = torch.mm(soft_weights, centroids)
-            chunks.append(soft_embeddings.cpu())
+                chunks.append(soft_weights.cpu())
 
     return torch.cat(chunks, dim=0)
 
 
-def _save_soft_embeddings(all_soft_embeddings, results, output_dir: str):
+def _save_soft_embeddings(all_soft_embeddings, results, output_dir: str, temperature: float):
     os.makedirs(output_dir, exist_ok=True)
 
     cursor = 0
@@ -168,7 +166,19 @@ def _save_soft_embeddings(all_soft_embeddings, results, output_dir: str):
         protein_emb = all_soft_embeddings[cursor : cursor + length]
         cursor += length
         out_path = Path(output_dir) / f"{name}.pt"
-        torch.save(protein_emb, out_path)
+        if temperature == 0:
+            payload = {
+                "type": "hard_ids",
+                "data": protein_emb.to(dtype=torch.long),
+                "temperature": float(temperature),
+            }
+        else:
+            payload = {
+                "type": "token_weights",
+                "data": protein_emb.to(dtype=torch.float32),
+                "temperature": float(temperature),
+            }
+        torch.save(payload, out_path)
         print(
             f"[{index}/{total_proteins}] Saved {name}: shape {tuple(protein_emb.shape)}",
             flush=True,
@@ -288,8 +298,8 @@ def precompute_soft_embeddings_for_temperatures(
 
     for temperature in temperatures:
         print(f"Computing soft embeddings for T={temperature}...")
-        all_soft_embeddings = _soft_from_node_embeddings(
-            node_embeddings_cpu=graph_embeddings,
+        all_soft_embeddings = _token_distribution_from_graph_embeddings(
+            graph_embeddings_cpu=graph_embeddings,
             centroids=centroids,
             cluster_model=cluster_model,
             temperature=temperature,
@@ -305,6 +315,7 @@ def precompute_soft_embeddings_for_temperatures(
             all_soft_embeddings=all_soft_embeddings,
             results=results,
             output_dir=output_dir,
+            temperature=temperature,
         )
         print(f"Done. Soft embeddings saved to {output_dir}")
 

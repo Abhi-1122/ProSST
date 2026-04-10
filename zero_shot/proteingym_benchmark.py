@@ -2,10 +2,8 @@ import os
 from argparse import ArgumentParser
 from pathlib import Path
 
-import joblib
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from Bio import SeqIO
 from scipy.stats import spearmanr
 from transformers import AutoModelForMaskedLM, AutoTokenizer
@@ -61,73 +59,6 @@ def _get_structure_embeddings(module):
         if hasattr(module, attr):
             return getattr(module, attr)
     raise AttributeError("Could not locate structure embedding table on embedding module")
-
-
-def _get_or_fit_projection(model, soft_embedding_dim: int, structure_vocab_size: int):
-    hidden_dim = model.config.hidden_size
-    key = f"{soft_embedding_dim}->{hidden_dim}:vocab{structure_vocab_size}"
-    model_device = _get_model_device(model)
-    if not hasattr(score_protein_soft, "_proj"):
-        score_protein_soft._proj = {}
-    if key in score_protein_soft._proj:
-        return score_protein_soft._proj[key].to(model_device)
-
-    static_dir = Path(__file__).resolve().parent.parent / "prosst" / "structure" / "static"
-    cluster_model_path = static_dir / f"{structure_vocab_size}.joblib"
-    if not cluster_model_path.exists():
-        raise FileNotFoundError(
-            f"Missing centroid file for vocab size {structure_vocab_size}: {cluster_model_path}"
-        )
-
-    centroids = torch.tensor(
-        joblib.load(cluster_model_path).cluster_centers_,
-        dtype=torch.float32,
-        device=model_device,
-    )
-    if centroids.ndim != 2 or centroids.shape[1] != soft_embedding_dim:
-        raise ValueError(
-            f"Centroid shape mismatch: expected (*, {soft_embedding_dim}), got {tuple(centroids.shape)}"
-        )
-
-    emb_module = _get_embedding_module(model)
-    structure_embeddings = _get_structure_embeddings(emb_module)
-    struct_weight = structure_embeddings.weight.detach().to(model_device)
-
-    if struct_weight.shape[0] == structure_vocab_size + 3:
-        target = struct_weight[3 : 3 + structure_vocab_size]
-    elif struct_weight.shape[0] >= structure_vocab_size:
-        target = struct_weight[:structure_vocab_size]
-    else:
-        raise ValueError(
-            f"Structure embedding table too small: {struct_weight.shape[0]} rows for vocab {structure_vocab_size}"
-        )
-
-    projection = torch.linalg.lstsq(centroids, target).solution
-    score_protein_soft._proj[key] = projection.detach().cpu()
-    return projection
-
-
-def _load_centroids(structure_vocab_size: int, soft_embedding_dim: int, model_device):
-    key = f"{structure_vocab_size}:{soft_embedding_dim}"
-    if not hasattr(score_protein_soft, "_centroids"):
-        score_protein_soft._centroids = {}
-    if key not in score_protein_soft._centroids:
-        static_dir = Path(__file__).resolve().parent.parent / "prosst" / "structure" / "static"
-        cluster_model_path = static_dir / f"{structure_vocab_size}.joblib"
-        if not cluster_model_path.exists():
-            raise FileNotFoundError(
-                f"Missing centroid file for vocab size {structure_vocab_size}: {cluster_model_path}"
-            )
-        centroids = torch.tensor(
-            joblib.load(cluster_model_path).cluster_centers_,
-            dtype=torch.float32,
-        )
-        if centroids.ndim != 2 or centroids.shape[1] != soft_embedding_dim:
-            raise ValueError(
-                f"Centroid shape mismatch: expected (*, {soft_embedding_dim}), got {tuple(centroids.shape)}"
-            )
-        score_protein_soft._centroids[key] = centroids
-    return score_protein_soft._centroids[key].to(model_device)
 
 
 def _get_structure_token_embedding_table(model, structure_vocab_size: int):
@@ -219,92 +150,110 @@ def score_protein_soft(
 
     sequence = read_seq(residue_fasta)
     model_device = _get_model_device(model)
-    soft_struct_emb = torch.load(soft_emb_file, map_location=model_device)
+    soft_payload = torch.load(soft_emb_file, map_location=model_device)
 
     tokenized_results = tokenizer([sequence], return_tensors="pt")
     input_ids = tokenized_results["input_ids"].to(model_device)
     attention_mask = tokenized_results["attention_mask"].to(model_device)
 
     hidden_dim = model.config.hidden_size
-    token_embedding_table, emb_module, structure_embeddings = _get_structure_token_embedding_table(
+    token_embedding_table, emb_module, _ = _get_structure_token_embedding_table(
         model=model,
         structure_vocab_size=structure_vocab_size,
     )
 
-    if soft_struct_emb.ndim != 2 or soft_struct_emb.shape[1] != soft_embedding_dim:
-        raise ValueError(
-            f"Expected soft embedding shape (L, {soft_embedding_dim}), got {tuple(soft_struct_emb.shape)}"
-        )
-
     residue_len = input_ids.shape[1] - 2
-    if soft_struct_emb.shape[0] != residue_len:
-        raise ValueError(
-            f"Length mismatch for {name}: sequence has {residue_len} residues but soft embeddings have {soft_struct_emb.shape[0]} rows"
-        )
-
-    soft_struct_emb = soft_struct_emb.to(model_device)
     token_embedding_table = token_embedding_table.to(model_device)
 
-    if soft_temperature is not None:
-        if soft_temperature < 0:
-            raise ValueError("soft_temperature must be >= 0")
-        centroids = _load_centroids(
-            structure_vocab_size=structure_vocab_size,
-            soft_embedding_dim=soft_embedding_dim,
-            model_device=model_device,
-        )
-        soft_norm = F.normalize(soft_struct_emb, p=2, dim=-1)
-        centroid_norm = F.normalize(centroids, p=2, dim=-1)
-        cosine_sim = torch.mm(soft_norm, centroid_norm.T)
-        if soft_temperature == 0:
-            hard_idx = torch.argmax(cosine_sim, dim=-1)
-            projected = token_embedding_table[hard_idx]
+    run_native_hard_path = False
+    native_ss_input_ids = None
+
+    if isinstance(soft_payload, dict):
+        payload_type = soft_payload.get("type", None)
+        payload_data = soft_payload.get("data", None)
+        if payload_data is None:
+            raise ValueError(f"Malformed soft payload in {soft_emb_file}: missing 'data'")
+
+        if payload_type == "hard_ids":
+            structure_ids = payload_data.to(model_device).long()
+            if structure_ids.ndim != 1:
+                raise ValueError(
+                    f"Expected hard_ids shape (L,), got {tuple(structure_ids.shape)}"
+                )
+            if structure_ids.shape[0] != residue_len:
+                raise ValueError(
+                    f"Length mismatch for {name}: sequence has {residue_len} residues but hard_ids has {structure_ids.shape[0]} rows"
+                )
+            run_native_hard_path = True
+            native_ss_input_ids = tokenize_structure_sequence(structure_ids.tolist()).to(model_device)
+        elif payload_type == "token_weights":
+            token_weights = payload_data.to(model_device).float()
+            if token_weights.ndim != 2 or token_weights.shape[1] != structure_vocab_size:
+                raise ValueError(
+                    f"Expected token_weights shape (L, {structure_vocab_size}), got {tuple(token_weights.shape)}"
+                )
+            if token_weights.shape[0] != residue_len:
+                raise ValueError(
+                    f"Length mismatch for {name}: sequence has {residue_len} residues but token_weights has {token_weights.shape[0]} rows"
+                )
+            projected = torch.mm(token_weights, token_embedding_table)
         else:
-            soft_weights = torch.softmax(cosine_sim / soft_temperature, dim=-1)
-            projected = torch.mm(soft_weights, token_embedding_table)
+            raise ValueError(
+                f"Unsupported payload type '{payload_type}' in {soft_emb_file}; regenerate soft embeddings with updated precompute script"
+            )
     else:
-        projection = _get_or_fit_projection(
-            model=model,
-            soft_embedding_dim=soft_embedding_dim,
-            structure_vocab_size=structure_vocab_size,
-        )
-        projected = soft_struct_emb @ projection
+        legacy_tensor = soft_payload.to(model_device)
+        if legacy_tensor.ndim == 1:
+            if legacy_tensor.shape[0] != residue_len:
+                raise ValueError(
+                    f"Length mismatch for {name}: sequence has {residue_len} residues but ids tensor has {legacy_tensor.shape[0]} rows"
+                )
+            run_native_hard_path = True
+            native_ss_input_ids = tokenize_structure_sequence(legacy_tensor.long().tolist()).to(model_device)
+        elif legacy_tensor.ndim == 2 and legacy_tensor.shape[1] == structure_vocab_size:
+            if legacy_tensor.shape[0] != residue_len:
+                raise ValueError(
+                    f"Length mismatch for {name}: sequence has {residue_len} residues but token weight tensor has {legacy_tensor.shape[0]} rows"
+                )
+            projected = torch.mm(legacy_tensor.float(), token_embedding_table)
+        else:
+            raise ValueError(
+                "Legacy soft embedding tensor is unsupported; regenerate with updated precompute to save token_weights/hard_ids"
+            )
 
-    pad = torch.zeros(1, hidden_dim, device=model_device)
-    struct_hidden = torch.cat([pad, projected, pad], dim=0).unsqueeze(0)
-
-    activation_store = {}
-
-    def pre_hook(module, args, kwargs):
-        if kwargs is None:
-            return None
-        ss_ids = kwargs.get("ss_input_ids", None)
-        if ss_ids is not None:
-            activation_store["ss_emb"] = structure_embeddings(ss_ids)
-        return None
-
-    def embedding_hook(module, args, output):
-        ss_emb_added = activation_store.get("ss_emb", None)
-        if ss_emb_added is None:
-            return output
-        if isinstance(output, tuple):
-            corrected = output[0] - ss_emb_added + struct_hidden
-            return (corrected, *output[1:])
-        return output - ss_emb_added + struct_hidden
-
-    hook_pre = emb_module.register_forward_pre_hook(pre_hook, with_kwargs=True)
-    hook_post = emb_module.register_forward_hook(embedding_hook)
-    try:
-        dummy_ss = tokenize_structure_sequence([0] * residue_len).to(model_device)
+    if run_native_hard_path:
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            ss_input_ids=dummy_ss,
+            ss_input_ids=native_ss_input_ids,
             labels=input_ids,
         )
-    finally:
-        hook_pre.remove()
-        hook_post.remove()
+    else:
+        pad = torch.zeros(1, hidden_dim, device=model_device)
+        struct_hidden = torch.cat([pad, projected, pad], dim=0).unsqueeze(0)
+
+        def embedding_hook(module, args, output):
+            mask = attention_mask.to(struct_hidden.device).unsqueeze(-1).to(struct_hidden.dtype)
+            ss_embed = module.ss_layer_norm(struct_hidden)
+            ss_embed = ss_embed * mask
+            ss_embed = module.dropout(ss_embed)
+            if isinstance(output, tuple):
+                if len(output) == 2:
+                    return output[0], ss_embed
+                return output[0], ss_embed, *output[2:]
+            return output
+
+        hook_post = emb_module.register_forward_hook(embedding_hook)
+        try:
+            dummy_ss = tokenize_structure_sequence([0] * residue_len).to(model_device)
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                ss_input_ids=dummy_ss,
+                labels=input_ids,
+            )
+        finally:
+            hook_post.remove()
 
     logits = outputs.logits
     logits = torch.log_softmax(logits[:, 1:-1, :], dim=-1)

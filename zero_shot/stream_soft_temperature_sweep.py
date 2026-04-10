@@ -76,12 +76,18 @@ def _compute_soft_embedding_for_protein(
         if temperature == 0:
             hard_idx_np = cluster_model.predict(graph_embeddings_norm.detach().cpu().numpy())
             hard_idx = torch.as_tensor(hard_idx_np, dtype=torch.long, device=predictor.device)
-            soft_embeddings = centroids[hard_idx]
-        else:
-            soft_weights = torch.softmax(cosine_sim / temperature, dim=-1)
-            soft_embeddings = torch.mm(soft_weights, centroids)
+            return {
+                "type": "hard_ids",
+                "data": hard_idx.cpu(),
+                "temperature": float(temperature),
+            }
 
-    return soft_embeddings.cpu()
+        soft_weights = torch.softmax(cosine_sim / temperature, dim=-1)
+        return {
+            "type": "token_weights",
+            "data": soft_weights.cpu(),
+            "temperature": float(temperature),
+        }
 
 
 def _compute_hard_ids_for_protein(
@@ -229,7 +235,7 @@ def run_temperature(
             del hard_ids
         else:
             print(f"[{i}/{len(protein_names)}] running GVP + soft encoding", flush=True)
-            soft_embedding = _compute_soft_embedding_for_protein(
+            soft_payload = _compute_soft_embedding_for_protein(
                 predictor=predictor,
                 cluster_model=cluster_model,
                 centroids=centroids,
@@ -237,13 +243,14 @@ def run_temperature(
                 graphs=graphs,
                 temperature=temperature,
             )
+            payload_data = soft_payload["data"]
             print(
-                f"[{i}/{len(protein_names)}] soft embedding shape {tuple(soft_embedding.shape)}",
+                f"[{i}/{len(protein_names)}] soft payload {soft_payload['type']} shape {tuple(payload_data.shape)}",
                 flush=True,
             )
 
             temp_soft_file = temp_soft_dir / f"{protein_name}.pt"
-            torch.save(soft_embedding, temp_soft_file)
+            torch.save(soft_payload, temp_soft_file)
             print(f"[{i}/{len(protein_names)}] wrote temp embedding {temp_soft_file.name}", flush=True)
 
             print(f"[{i}/{len(protein_names)}] scoring", flush=True)
@@ -256,7 +263,6 @@ def run_temperature(
                 output_mutant_dir=str(output_mutant_dir),
                 name=protein_name,
                 model_name=model_name,
-                soft_embedding_dim=soft_embedding.shape[1],
                 structure_vocab_size=centroids.shape[0],
                 soft_temperature=temperature,
             )
