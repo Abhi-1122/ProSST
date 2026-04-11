@@ -9,6 +9,9 @@ if python zero_shot/proteingym_benchmark.py \
     --residue_dir zero_shot/example_data/residue_sequence \
     --structure_dir zero_shot/example_data/structure_sequence/2048 \
     --mutant_dir zero_shot/example_data/substitutions \
+    --pdb_dir ProteinGym_v1_AlphaFold2_PDB/proteingym_pdb \
+    --plddt_center 70.0 \
+    --plddt_sharpness 0.15 \
     > "$TMP_LOG" 2>&1
 then
     # Run evaluation → final log

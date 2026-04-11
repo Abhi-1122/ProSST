@@ -86,6 +86,7 @@ def generate_graph(pdb_file, max_distance=10):
     seq = []
     # extract amino acid coordinates
     aa_coords = {"N": [], "CA": [], "C": [], "O": []}
+    plddt_values = []
     
     for model in structure:
         for chain in model:
@@ -95,6 +96,11 @@ def generate_graph(pdb_file, max_distance=10):
                     for atom_name in aa_coords.keys():
                         atom = residue[atom_name]
                         aa_coords[atom_name].append(atom.get_coord().tolist())
+                    try:
+                        ca_bfactor = residue["CA"].get_bfactor()
+                    except KeyError:
+                        ca_bfactor = 80.0
+                    plddt_values.append(float(ca_bfactor))
     aa_seq = "".join([seq1(aa) for aa in seq])
     
         
@@ -131,13 +137,15 @@ def generate_graph(pdb_file, max_distance=10):
     # edge_s: [edge_num, 16+16]
     # edge_v: [edge_num, 1, 3]
     node_s, node_v, edge_s, edge_v = map(torch.nan_to_num, (node_s, node_v, edge_s, edge_v))
+    plddt_tensor = torch.tensor(plddt_values, dtype=torch.float32)
     data = Data(
         node_s=node_s, node_v=node_v, 
         edge_index=edge_index, 
         edge_s=edge_s, edge_v=edge_v,
         distances=distances,
         aa_seq=aa_seq,
-        ca_coords=ca_coords
+        ca_coords=ca_coords,
+        plddt=plddt_tensor,
     )
     
     return data

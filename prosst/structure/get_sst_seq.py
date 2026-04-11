@@ -97,6 +97,7 @@ def subgraph_conventer(subgraph_dir, pdb_dir, max_batch_nodes, num_processes=12)
         result_dict["name"] = name + ".pdb"
         aa_seq = extract_seq_from_pdb(os.path.join(pdb_dir, f"{name}.pdb"))
         result_dict["aa_seq"] = aa_seq
+        result_dict["plddt"] = None
         return result_dict, len(aa_seq)
 
     for result in tqdm(iter_threading_map(process_subgraph_file, subgraph_files, num_processes), total = len(subgraph_files)):
@@ -151,6 +152,7 @@ def graph_conventer(
         result_dict["name"] = graph_file.split("/")[-1].split(".")[0] + ".pdb"
         graph = torch.load(graph_file)
         result_dict["aa_seq"] = graph.aa_seq
+        result_dict["plddt"] = graph.plddt.tolist() if hasattr(graph, "plddt") else None
         anchor_nodes = list(range(0, len(graph.aa_seq), 1))
 
         def process_subgraph(anchor_node):
@@ -235,6 +237,7 @@ def process_pdb_file(
 
     # multi thread for subgraph
     result_dict["aa_seq"] = graph.aa_seq
+    result_dict["plddt"] = graph.plddt.tolist() if hasattr(graph, "plddt") else None
     anchor_nodes = list(range(0, len(graph.node_s), 1))
 
     def process_subgraph(anchor_node):
